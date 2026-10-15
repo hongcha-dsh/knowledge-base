@@ -1,0 +1,13 @@
+# 默认：文本文件交给 git 自动识别，仓库内统一 LF
+* text=auto
+
+# Windows 启动器是 GBK（代码页 936）+ CRLF，必须原样存取。
+# 标记为二进制可禁止一切换行符与编码转换，保证 clone 出来的字节与原始一致。
+*.bat -text
+*.vbs -text
+
+# 源码与文档显式声明为 LF 文本
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf

@@ -1,0 +1,5 @@
+pymupdf          # PDF 文本层提取 + 页面转图片
+python-docx      # docx 提取
+opencc           # 简繁归一（pip install opencc；若不可用则 opencc-python-reimplemented）
+httpx            # 调 MinerU Standard API（上传/轮询/下载）
+openpyxl         # xlsx 读取（地支藏干等表格类资料）
