@@ -1,10 +1,12 @@
-# 知识库（Knowledge Base）
+# 知识库 Knowledge Base
 
 把书籍资料变成**可被 AI 逐字引用**的本地知识库。
 
 `docx / PDF / txt / md / xlsx` → 入库管线 → **逐字转录的原文 + 块 ID + 倒排索引** → AI 按协议检索、引用原文并讲解。
 
 纯 Python + Tkinter，零联网依赖（只有扫描版 PDF 的 OCR 会调用 MinerU 云端 API）。
+
+> A local book-to-knowledge-base system. It ingests `docx / PDF / txt / md / xlsx` into a **verbatim transcript with stable block IDs and an inverted index**, so an AI can retrieve passages and cite the source text line by line — every quote traceable to a specific book, page and block ID.
 
 ---
 
@@ -131,6 +133,8 @@ pip install -r 资料预处理/控制台/requirements.txt
 
 填进控制台「⚙ 设置 → ① MinerU 区」，点**保存 Token**，再点**测试连通性**确认全部 `[OK]`。
 
+> 未配置时，扫描版 PDF 走不了 OCR 通道（离线报错、不消耗额度），入库列表里这类文件会标「未配 Token」。
+
 ### 标注 AI（可选，用 API 自动标注才需要）
 
 填 OpenAI 兼容接口的三要素：
@@ -165,21 +169,22 @@ pip install -r 资料预处理/控制台/requirements.txt
 
 ```
 .
-├─ 启动控制台.vbs               # 唯一启动入口（双击即可）
-├─ 路径配置.example.json        # 配置模板 → 复制成 路径配置.json
+├─ 启动控制台.vbs                       # 唯一启动入口（双击即可）
+├─ 路径配置.example.json                # 配置模板 → 复制成 路径配置.json
 ├─ .gitignore
 ├─ 资料预处理/
-│  ├─ 脚本/                     # 入库管线与标注脚本
-│  └─ 控制台/                   # Tkinter 控制台
-│     ├─ app.py                 # 入口
-│     ├─ theme.py               # 色板令牌
-│     ├─ pages/                 # 书库页 / 入库窗 / 设置窗 / 外发标注
+│  ├─ 脚本/                             # 入库管线与标注脚本
+│  └─ 控制台/                           # Tkinter 控制台
+│     ├─ app.py                         # 入口
+│     ├─ theme.py                       # 色板令牌
+│     ├─ pages/                         # 书库页 / 入库窗 / 设置窗 / 外发标注
 │     ├─ requirements.txt
 │     └─ 启动控制台.bat
 └─ 我的书库/
+   ├─ .trae/rules/project_rules.md      # 给 AI 的检索协议（TRAE 工作区自动加载）
    └─ 检索脚本/
-      ├─ search_keyword.py      # 检索（四模式）
-      └─ eval_recall.py         # 命中率评测尺
+      ├─ search_keyword.py              # 检索（四模式）
+      └─ eval_recall.py                 # 命中率评测尺
 ```
 
 运行时会生成（已在 `.gitignore` 中排除，不会进版本库）：
@@ -270,13 +275,18 @@ python eval_recall.py --自检     # 自检
 
 ## 接入 AI 对话
 
-脚本本身已能完成检索，但要让 AI **主动按协议引用原文**，需要在你自己的 AI 工作区里放一份检索协议，约定三件事：
+仓库内已包含一份完整的检索协议：**`我的书库/.trae/rules/project_rules.md`**。
 
-1. 回答前先跑 `search_keyword.py --fetch "<关键词>"` 取回原文逐字内容
-2. 引用的每段前面标 `《书名》+ 印刷页码`，段末以 `【块 ID】` 收口
-3. **原文一字不改编**，讲解与原文分开写
+在 [TRAE](https://www.trae.ai/) 中把 **`我的书库`** 文件夹作为工作区打开，这份协议会自动加载生效。它约定了「AI 真查了书」的两个可验证标志：
 
-> 说明：面向 AI 的协议文本与工作区配置属于使用者的本地定制，**未包含在本仓库中**。
+1. **生效宣告** —— 每次会话首次按协议作答，回答第一行固定输出 `🔎 已按知识库检索协议检索`（同会话不重复，没走检索流程的回答不许带这个标记）
+2. **块 ID 收口** —— 引用的每段原文前面标 `《书名》+ 印刷页码`，段末以 `【块 ID】` 收口
+
+两者缺一，就说明 AI 没查书、在凭印象编，可以直接打回要求「按检索协议检索后再回答」。
+
+协议同时规定了四段式输出（📖定位 → 📜原文 → 🧠讲解 → 📝总结）、每次最多引用 5 块、标注回环铁律（标签索引没命中 ≠ 原文没有，必须回退全文扫描才能下结论）等口径。
+
+> 如果你用别的 AI 工具（非 TRAE），把这份协议文本作为系统提示词或工作区规则交给它即可，效果相同。
 
 ---
 
@@ -307,11 +317,11 @@ python eval_recall.py --自检     # 自检
 
 ## 说明与限制
 
-- **本仓库只包含代码**，不含任何书籍数据、索引、评测集与运行产物。首次使用需要自备资料，用法见上文。
+- **本仓库只包含代码与协议**，不含任何书籍数据、索引、评测集与运行产物。首次使用需要自备资料，用法见上文。
 - 项目按**个人本地使用**设计：控制台是单机 GUI，没有账号体系、没有多用户隔离、没有服务端。
-- 面向 AI 的检索协议文本与工作区定制不随仓库发布，需自行编写（见「接入 AI 对话」）。
 - 未实现（规划中）：向量检索通道、学习模式、检索脚本的 MCP 化。
 - 数据安全由使用者自己负责：密钥请走环境变量或本地配置文件，`路径配置.json` 已在 `.gitignore` 中排除。
+- 面向 AI 的工作区激活配置（DSH 等工具专属）不随仓库发布，用 TRAE 或把协议文本直接交给 AI 均可正常使用。
 
 ---
 
