@@ -84,7 +84,7 @@ openpyxl     # xlsx 读取（表格类资料）
 ### 1. 获取代码
 
 ```bash
-git clone https://github.com/774015352-sys/knowledge-base.git
+git clone https://github.com/hongcha-dsh/knowledge-base.git
 cd knowledge-base
 ```
 
