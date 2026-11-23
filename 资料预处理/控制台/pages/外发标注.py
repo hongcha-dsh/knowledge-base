@@ -97,11 +97,24 @@ class 外发标注面板(ttk.LabelFrame):
     def _finish_task(self, tid, code, ok_text, fail_text):
         taskcenter.finish(tid, code == 0, ok_text if code == 0 else fail_text)
 
-    def _run(self, *args, ok_text="完成", fail_text="失败"):
-        """同步跑一次 annotate_pack 子进程；输出逐行记入 TaskCenter。"""
-        book = self._get_book()
-        tid = taskcenter.start("标注", f"《{book}》外部 AI 标注" if book else "外部 AI 标注")
+    def _start_task(self, kind, title):
+        """#65 M1：启动写任务；写锁被占时人话提示并返回 0（调用点不得再跑子进程）。"""
+        tid = taskcenter.start(kind, title)
+        if not tid:
+            self._status(f"🟡 另一个写库任务正在进行中，本次「{kind}」没有开始（书库未改动）", "orange")
+            messagebox.showinfo("提示", taskcenter.lock_block_text(kind))
+            return 0
         self._last_task_id = tid
+        return tid
+
+    def _run(self, *args, ok_text="完成", fail_text="失败"):
+        """同步跑一次 annotate_pack 子进程；输出逐行记入 TaskCenter。
+
+        #65 M1：写锁被占时返回 None（已提示），调用点不要把 None 当业务失败再弹窗。"""
+        book = self._get_book()
+        tid = self._start_task("标注", f"《{book}》外部 AI 标注" if book else "外部 AI 标注")
+        if not tid:
+            return None
         try:
             code, out, err = run_script("annotate_pack.py", *args)
         except Exception as e:
@@ -136,6 +149,8 @@ class 外发标注面板(ttk.LabelFrame):
             return
         ok = self._run("--生成全书", "--书名", book,
                        ok_text=f"任务包已生成（{book}）", fail_text="任务包生成失败")
+        if ok is None:      # 写锁被占：已提示，不再报“生成失败”
+            return
         if not ok:
             self._status("🔴 任务包生成失败", "red")
             self._show_fail_dialog(
@@ -174,8 +189,9 @@ class 外发标注面板(ttk.LabelFrame):
                 "提示",
                 f"还没有可导入的文件。\n\n请把 AI 填好的标注文件放进这个文件夹：\n{back}")
             return
-        tid = taskcenter.start("标注", f"《{book}》外部 AI 标注")
-        self._last_task_id = tid
+        tid = self._start_task("标注", f"《{book}》外部 AI 标注")
+        if not tid:
+            return
         try:
             code, out, err = run_script("annotate_pack.py", "--导回全书", "--书名", book)
         except Exception as e:
@@ -249,6 +265,8 @@ class 外发标注面板(ttk.LabelFrame):
             return
         ok = self._run("--删除", "--书名", book,
                        ok_text="已删除本书全部任务包", fail_text="删除失败")
+        if ok is None:      # 写锁被占：已提示，不再把状态行改写成“删除失败”
+            return
         self._status("🟢 已删除本书全部任务包" if ok else "🔴 删除失败",
                      "green" if ok else "red")
 

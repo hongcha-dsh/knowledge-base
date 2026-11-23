@@ -153,6 +153,12 @@ def get_chapters(book_title: str) -> list:
 # M1：任务与日志归全局 TaskCenter，主页底部状态条只是任务的"只读视图"；
 # 四页现有页级队列保留不变（双写），保证四页功能零回归（R14）。
 
+# ---------- #65 M1：写任务全生命周期互斥 ----------
+# 写任务＝会写书库/索引/报告/缓存/任务包的页面任务（TaskCenter 的 kind 白名单）。
+# 约定：start 时获取全库写锁并一直持有到 finish（成功/失败都释放）；只读任务不加锁；
+# 锁获取失败 start 返回 0——调用点据此给人话提示，且不得再启动后台 worker。
+WRITE_TASK_KINDS = frozenset({"入库", "标注", "重建", "更新", "删除", "清理", "验证"})
+
 
 @dataclass
 class Task:
@@ -171,25 +177,74 @@ class Task:
 
 
 class TaskCenter:
-    """全局唯一任务中心：worker 线程只调本类（内部加锁），不碰任何 UI 控件。"""
+    """全局唯一任务中心：worker 线程只调本类（内部加锁），不碰任何 UI 控件。
+
+    #65 M1：写任务（WRITE_TASK_KINDS）在 start 时获取 common.exclusive_write_lock，
+    整个多步任务期间持有、finish 时释放（成功/失败/重复 finish 都安全），
+    多个控制台同时点写操作时只有先拿到锁的那个能启动，避免交叉写。"""
 
     LOG_CAP = 5000                   # 单任务日志缓冲封顶，防长任务内存膨胀
+    WRITE_KINDS = WRITE_TASK_KINDS
 
-    def __init__(self):
+    def __init__(self, lock_factory=None):
         self._tasks = {}
         self._order = []
         self._next = 1
         self._lock = _threading.Lock()
+        self._lock_factory = lock_factory   # 测试可注入；默认 common.exclusive_write_lock
+        self._write_cm = None               # 当前写任务持有的锁上下文（#65 M1）
+        self._write_tid = 0                 # 持锁任务 id；重复 finish 据此不复解锁/不误放
+        self.last_lock_error = ""           # 最近一次写锁获取失败的技术原因（空＝锁被占）
 
     def start(self, kind: str, title: str, total: int = 0) -> int:
-        """注册任务，返回 task_id。"""
+        """注册任务，返回 task_id；写任务同时获取全库写锁（#65 M1）。
+
+        写任务拿不到锁时返回 0：不注册任务、不持锁，调用点必须据此提示用户
+        并放弃启动后台 worker（只读任务不受影响，正常返回 task_id）。"""
+        lock_cm = None
         with self._lock:
-            tid = self._next
-            self._next += 1
-            self._tasks[tid] = Task(id=tid, kind=kind, title=title, total=total,
-                                    updated=time.time(), started=time.time())
-            self._order.append(tid)
+            if kind in self.WRITE_KINDS:
+                if self._write_cm is not None:
+                    self.last_lock_error = ""        # 本控制台已有写任务在跑
+                    return 0
+                factory = self._lock_factory or common.exclusive_write_lock
+                try:
+                    lock_cm = factory(f"{kind}：{title}")
+                    lock_cm.__enter__()
+                except RuntimeError:
+                    self.last_lock_error = ""        # common 的约定：锁被占 → RuntimeError
+                    return 0
+                except Exception as e:               # 锁不可用（平台/权限等）：同样拦下，但不冒充“有任务在跑”
+                    self.last_lock_error = f"{type(e).__name__}: {e}"
+                    return 0
+                self.last_lock_error = ""
+                self._write_cm = lock_cm             # 先占位：注册期间别的线程 start 直接判冲突
+            try:
+                tid = self._next
+                self._next += 1
+                self._tasks[tid] = Task(id=tid, kind=kind, title=title, total=total,
+                                        updated=time.time(), started=time.time())
+                self._order.append(tid)
+            except BaseException:
+                if lock_cm is not None:              # 注册失败也不留锁
+                    self._write_cm = None
+                    try:
+                        lock_cm.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                raise
+            if lock_cm is not None:
+                self._write_tid = tid
             return tid
+
+    def lock_block_text(self, kind: str) -> str:
+        """写锁拦下启动时给用户的人话提示（messagebox / 状态行共用，不抛栈）。"""
+        if self.last_lock_error:
+            return (f"写库锁暂时不可用，本次「{kind}」已安全拦下，书库没有改动。\n\n"
+                    "请重启控制台后再试；若反复出现，可把这条提示复制给 AI 排查。\n\n"
+                    f"技术细节：{self.last_lock_error}")
+        return (f"另一个写库任务正在进行中，本次「{kind}」没有开始，书库没有改动。\n\n"
+                "请等它完成后再试；当前窗口可以继续使用，不会卡住，也不会丢数据。")
 
     def progress(self, tid: int, current=None, step=None, title=None):
         """更新进度：current 可为 0（尚未完成一本）。"""
@@ -218,17 +273,32 @@ class TaskCenter:
 
     def finish(self, tid: int, ok: bool, summary: str = "", result: dict = None):
         """标记任务结束（替代 __DONE_BATCH__ 等哨兵消息的进度语义）。
+
+        #65 M1：写任务的写锁在这里释放——成功、失败都释放；同一 tid 重复 finish
+        不会重复解锁，也不会误放别的任务的锁。
         result（#38）：业务收尾载荷——视图（尤其关窗重开后的新实例）据此恢复结果区，
         属 Task 级数据、不随窗口销毁（R2）。"""
+        release_cm = None
         with self._lock:
-            t = self._tasks.get(tid)
-            if not t:
-                return
-            t.status = "done" if ok else "failed"
-            t.summary = summary
-            if result is not None:
-                t.result = result
-            t.updated = time.time()
+            if tid == self._write_tid:               # 只释放本任务持有的锁
+                release_cm = self._write_cm
+                self._write_cm = None
+                self._write_tid = 0
+            try:
+                t = self._tasks.get(tid)
+                if not t or t.status != "running":
+                    return                  # 重复 finish / 未知任务：不改状态（幂等），也不重复解锁
+                t.status = "done" if ok else "failed"
+                t.summary = summary
+                if result is not None:
+                    t.result = result
+                t.updated = time.time()
+            finally:
+                if release_cm is not None:           # 标记失败/异常也要把锁放掉
+                    try:
+                        release_cm.__exit__(None, None, None)
+                    except Exception:
+                        pass
 
     def snapshot(self) -> list:
         """返回只读快照（dict 列表），供 UI 泵轮询；不暴露可变 Task 对象。"""

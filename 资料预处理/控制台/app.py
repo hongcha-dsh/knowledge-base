@@ -107,19 +107,69 @@ class App(tk.Tk):
     def _build(self):
         self._build_statusbar()
 
-        # #25 M4：取消页签导航——主窗口＝书库主页（标题行右侧「⚙ 设置」入口）
+        # #25 M4：取消页签导航——主窗口＝书库主页（标题行右侧「⚙ 设置」与「查询模式」入口）
         header = ttk.Frame(self)
         header.pack(side="top", fill="x")
         ttk.Label(header, text="知识库 · 管理控制台",
                   font=("Microsoft YaHei UI", 11, "bold")).pack(
             side="left", padx=10, pady=(8, 4))
         ttk.Button(header, text="⚙ 设置", width=10, command=self.open_settings).pack(
-            side="right", padx=10, pady=(6, 2))
+            side="right", padx=(4, 10), pady=(6, 2))
+        self._query_mode = self._read_query_mode()
+        self.query_mode_btn = ttk.Button(
+            header, text=self._query_mode_label(self._query_mode),
+            width=16, command=self.toggle_query_mode)
+        self.query_mode_btn.pack(side="right", padx=(0, 4), pady=(6, 2))
 
         self.container = ttk.Frame(self)
         self.container.pack(side="top", fill="both", expand=True)
         self.home = 书库页(self.container)
         self.home.pack(fill="both", expand=True)
+
+    @staticmethod
+    def _config_path() -> Path:
+        import os
+        override = os.environ.get(common.CONFIG_PATH_ENV)
+        if override:
+            p = Path(override)
+            return p if p.is_absolute() else common.PROJECT_ROOT / p
+        return common.PROJECT_ROOT / "路径配置.json"
+
+    @staticmethod
+    def _read_query_mode() -> str:
+        """读取默认查询档位（速查 / 完整），缺省或异常回落「完整」。"""
+        try:
+            mode = common.load_config().get("查询模式", "完整")
+        except Exception:
+            mode = "完整"
+        return "速查" if mode == "速查" else "完整"
+
+    @staticmethod
+    def _query_mode_label(mode: str) -> str:
+        return f"查询模式：{mode}"
+
+    def toggle_query_mode(self):
+        """切换并持久化查询模式（速查 <-> 完整）。"""
+        new_mode = "完整" if self._query_mode == "速查" else "速查"
+        cfg_path = self._config_path()
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg["查询模式"] = new_mode
+            common.atomic_write_text(
+                cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
+        except Exception as e:
+            messagebox.showerror("保存失败", f"无法保存查询模式：\n{e}")
+            return self._query_mode
+        self._query_mode = new_mode
+        self.query_mode_btn.config(text=self._query_mode_label(new_mode))
+        if hasattr(self, "home") and hasattr(self.home, "_set_status"):
+            tip = (
+                "已切为「速查」模式：查书默认先返回前 3 块原文与精简讲解，需要时可再展开完整版。"
+                if new_mode == "速查"
+                else "已切为「完整」模式：查书默认返回前 5 块原文与完整四段式讲解。"
+            )
+            self.home._set_status(tip, "green")
+        return new_mode
 
     # ---------- #25 M3/M4：按需弹窗（单例注册表，§4.2/R3） ----------
 

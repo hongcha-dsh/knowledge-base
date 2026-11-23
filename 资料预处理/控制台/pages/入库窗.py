@@ -443,6 +443,12 @@ class 入库窗(tk.Toplevel):
                       "（或者关掉 MinerU 版面分析 / 改强制关闭 OCR 模式）")
                 self._open_settings("mineru")
                 return
+        tid = taskcenter.start("入库", f"共 {len(files)} 本", total=len(files))
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self.step_lbl.config(text="🟡 另一个写库任务正在进行中，本次入库没有开始（书库未改动）")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("入库"))
+            return
         self._running = True
         self._sync_ingest_btn()
         self.result_frame.pack_forget()
@@ -450,7 +456,7 @@ class 入库窗(tk.Toplevel):
         self._reset_progress()
         self.step_lbl.config(text="入库中…（大文件 OCR 可能较久；可关闭本窗口，进度见主窗口底部状态条）")
         self.log.delete("1.0", "end")
-        self._task_id = taskcenter.start("入库", f"共 {len(files)} 本", total=len(files))
+        self._task_id = tid
         self._task_started = time.monotonic()
         self._last_line = ""
         threading.Thread(target=self._ingest_worker,
@@ -639,7 +645,13 @@ class 入库窗(tk.Toplevel):
                 "这会消耗接口额度。继续吗？"):
             return
         title = f"《{books[0]}》" if len(books) == 1 else f"{len(books)} 本"
-        self._task_id = taskcenter.start("标注", title, total=len(books))
+        tid = taskcenter.start("标注", title, total=len(books))
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self.step_lbl.config(text="🟡 另一个写库任务正在进行中，本次标注没有开始（书库未改动）")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("标注"))
+            return
+        self._task_id = tid
         self._task_started = time.monotonic()
         self._last_line = ""
         taskcenter.progress(self._task_id, step="调用标注 AI 填写")

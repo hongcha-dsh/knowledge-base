@@ -8,8 +8,8 @@
 块 ID 行（【书号·序号】p.…）与 隔离区.md 的标记行不参与对账（页码段允许三态变化）。
 
 用法：
-  python verify_fidelity.py --快照 --书名 玄空风水精论                 # 重切前留基线
-  python verify_fidelity.py --书名 玄空风水精论                        # 重切后对账
+  python verify_fidelity.py --快照 --书名 示例书名                 # 重切前留基线
+  python verify_fidelity.py --书名 示例书名                        # 重切后对账
   python verify_fidelity.py --书名 X --基线 <旧原文.md 路径>           # 指定基线
   python verify_fidelity.py --自检                                    # 门禁自检
 退出码：0=一致，1=不一致（丢字/乱序），2=黄灯（仅多出隔离区内容，需人工确认）

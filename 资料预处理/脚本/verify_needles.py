@@ -368,4 +368,4 @@ if __name__ == "__main__":
     if common.is_selfcheck():
         _selfcheck()
     else:
-        main()
+        common.run_with_write_lock(main, "密文验证")

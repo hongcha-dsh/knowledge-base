@@ -29,6 +29,10 @@
 - 改为**主窗口按内容自适应**：`App.fit_to_content()` 在启动后与高级区展开/折叠后各调一次——
   窗口长到内容需求高 + `minsize` 高度抬到需求高（用户也拖不小 → 按钮永不被压扁）；
   屏幕装不下时先压缩外发面板的表格行数（表格可滚动、按钮不可压扁），容量恢复后自动还原。
+
+#65 M1（2026-11-16）：重建索引区分更新保护书——书目录存在 更新保护.json 或 退休块.json 任一即
+视为受保护，只跑 A-04 建索引 → A-05 密文自检（不重跑 A-03/A-08，防旧提取缓存回退正文、重排
+已出生块 ID）；普通未更新书维持原「A-03 → 书配置 → A-04 → A-05」。
 """
 
 import json
@@ -91,6 +95,37 @@ def _counted_rmtree(path, on_progress=None, batch=200) -> int:
                 pass
     shutil.rmtree(p, ignore_errors=True)
     return total
+
+
+#: #65 M1：更新保护判据文件——书目录内任一存在即视为受保护（兼容旧书只有 退休块.json 的状态）
+_PROTECT_FILES = ("更新保护.json", "退休块.json")
+
+
+def _book_dir(title) -> Path:
+    """书库目录（保护判据与测试桩共用同一入口）。"""
+    return common.get_path("知识库") / "书籍" / title
+
+
+def _is_update_protected(title) -> bool:
+    """#65 M1：该书是否受更新保护（更新保护.json 或 退休块.json 任一存在）。
+
+    受保护＝正文与块 ID 已由 A-09 更新手术锁定，重建索引不得再从旧提取缓存跑 A-03
+    重新分块（会把正文回退到更新前、重排已出生块 ID）。"""
+    d = _book_dir(title)
+    return any((d / name).exists() for name in _PROTECT_FILES)
+
+
+def _rebuild_confirm_text(title, protected) -> str:
+    """重建确认文案（#65 M1）：受保护书只重建索引、不动正文，普通书维持原口径。"""
+    if protected:
+        return (f"《{title}》做过内容更新，正文和段落编号已锁定保护。\n\n"
+                "这次只会重新建立搜索索引并自动核对，不会重新整理正文，"
+                "也不会改动任何段落编号。\n\n"
+                "确定继续吗？")
+    return (f"将重新整理《{title}》的正文并重新建立搜索（沿用已有的识别结果，不会重新在线识别）。\n\n"
+            "注意：重建后正文核对码会变化，以前发给外部 AI 的标注文件将无法导入；"
+            "已导入的章节摘要不受影响。\n\n"
+            "确定继续吗？")
 
 
 class 书库页(tk.Frame):
@@ -529,10 +564,16 @@ class 书库页(tk.Frame):
                 "个别没过的章会自动重试 3 次。\n\n"
                 "这会消耗接口额度。继续吗？"):
             return
+        tid = taskcenter.start("标注", f"《{book}》", total=n_ch)
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self._set_status("🟡 另一个写库任务正在进行中，本次标注没有开始（书库未改动）", "orange")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("标注"))
+            return
         self._annot_running = True
         self.annotate_btn.state(["disabled"])
         self._set_status(f"API 自动标注中…（《{book}》逐章调用大模型，界面可正常操作）", "orange")
-        self._task_id = taskcenter.start("标注", f"《{book}》", total=n_ch)
+        self._task_id = tid
         taskcenter.progress(self._task_id, step="调用标注 AI 填写")
         threading.Thread(target=self._auto_fill_worker, args=(book, self._task_id),
                          daemon=True).start()
@@ -569,8 +610,9 @@ class 书库页(tk.Frame):
     # ---------- 排障：重建索引（#30 后台化 + #25 M1 任务中心；#40 起含自动验证） ----------
 
     def rebuild(self):
-        """重建索引：重跑 A-03 清洗分块 + A-04 建索引（复用提取缓存，不重烧 OCR），
-        末尾自动跑一次 A-05 密文自检（#40：原独立「重新验证」并入本流程）。"""
+        """重建索引（#65 M1）：普通书重跑 A-03 清洗分块 + 书配置 + A-04 建索引（复用提取缓存，
+        不重烧 OCR）；受更新保护书只跑 A-04，不从旧提取缓存重新生成正文与块 ID。
+        末尾均自动跑一次 A-05 密文自检（#40：原独立「重新验证」并入本流程）。"""
         b = self._selected()
         if not b:
             return
@@ -580,40 +622,54 @@ class 书库页(tk.Frame):
         if self._busy:
             messagebox.showinfo("提示", "已有排障操作进行中，请等待完成")
             return
-        if not messagebox.askyesno(
-                "确认重建",
-                f"将重新整理《{b['书名']}》的正文并重新建立搜索（沿用已有的识别结果，不会重新在线识别）。\n\n"
-                "注意：重建后正文核对码会变化，以前发给外部 AI 的标注文件将无法导入；已导入的章节摘要不受影响。\n\n"
-                "确定继续吗？"):
+        protected = _is_update_protected(b["书名"])
+        if not messagebox.askyesno("确认重建",
+                                   _rebuild_confirm_text(b["书名"], protected)):
+            return
+        tid = taskcenter.start("重建", f"《{b['书名']}》")
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self.status.config(text="🟡 另一个写库任务正在进行中，本次重建没有开始（书库未改动）", fg="orange")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("重建"))
             return
         self._busy = True
-        self.status.config(text=f"正在重建《{b['书名']}》索引…（界面可正常操作）", fg="orange")
-        self._task_id = taskcenter.start("重建", f"《{b['书名']}》")
-        taskcenter.progress(self._task_id, step="整理正文")
+        if protected:
+            self.status.config(
+                text=f"正在重建《{b['书名']}》搜索索引…（正文受更新保护，不重新整理；界面可正常操作）",
+                fg="orange")
+        else:
+            self.status.config(text=f"正在重建《{b['书名']}》索引…（界面可正常操作）", fg="orange")
+        self._task_id = tid
+        taskcenter.progress(self._task_id, step="建立索引" if protected else "整理正文")
         threading.Thread(target=self._rebuild_worker,
-                         args=(b["书名"], b["书号"], self._task_id), daemon=True).start()
+                         args=(b["书名"], b["书号"], self._task_id, protected),
+                         daemon=True).start()
 
-    def _rebuild_worker(self, title, book_id, task_id):
-        """后台线程：清洗分块 → 书级配置 → 建索引 → 自动密文自检（#40）；
-        只入队消息，不碰任何控件。"""
+    def _rebuild_worker(self, title, book_id, task_id, protected):
+        """后台线程（#65 M1）：受更新保护书只跑 A-04 建索引 → A-05 密文自检，禁止从旧提取
+        缓存重跑 A-03/A-08（会把正文回退到更新前、重排已出生块 ID）；普通书维持
+        A-03 清洗分块 → 书级配置 → A-04 → A-05。只入队消息，不碰任何控件。"""
         q = self._op_q.put
-        try:
-            code, out, err = run_script("clean_split.py", "--书号", book_id, "--书名", title)
-        except Exception as e:
-            taskcenter.finish(task_id, False, "整理正文异常")
-            q(("rebuild_done", title, False, "整理正文异常", f"后台执行异常：{e}"))
-            return
-        if code not in (0, 2):
-            taskcenter.finish(task_id, False, "整理正文失败")
-            q(("rebuild_done", title, False, "整理正文失败",
-               (out or err)[-800:] + "\n\n提示：若识别缓存已被清理，需重新入库。"))
-            return
-        if code == 2:
-            q(("status", "🟡 整理正文有警告（不影响），继续重建…", "orange"))
+        if not protected:
+            try:
+                code, out, err = run_script("clean_split.py", "--书号", book_id, "--书名", title)
+            except Exception as e:
+                taskcenter.finish(task_id, False, "整理正文异常")
+                q(("rebuild_done", title, False, "整理正文异常", f"后台执行异常：{e}"))
+                return
+            if code not in (0, 2):
+                taskcenter.finish(task_id, False, "整理正文失败")
+                q(("rebuild_done", title, False, "整理正文失败",
+                   (out or err)[-800:] + "\n\n提示：若识别缓存已被清理，需重新入库。"))
+                return
+            if code == 2:
+                q(("status", "🟡 整理正文有警告（不影响），继续重建…", "orange"))
         # #20 独立步骤（不阻塞）：自判过滤为空时由 LLM 产书级配置；失败回落自判/启发式
+        # #65 M1：受保护书跳过本步（契约只允许 A-04 → A-05）
         try:
-            taskcenter.progress(task_id, step="识别章节")
-            run_script("book_cfg_gen.py", "--书号", book_id, "--书名", title)
+            if not protected:
+                taskcenter.progress(task_id, step="识别章节")
+                run_script("book_cfg_gen.py", "--书号", book_id, "--书名", title)
             taskcenter.progress(task_id, step="建立索引")
             code, out, err = run_script("build_index.py", "--书号", book_id, "--书名", title)
         except Exception as e:
@@ -677,9 +733,15 @@ class 书库页(tk.Frame):
             filetypes=[("支持的资料", "*.docx *.pdf *.txt *.md *.xlsx"), ("所有文件", "*.*")])
         if not path:
             return
+        tid = taskcenter.start("更新", f"《{b['书名']}》")
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self.status.config(text="🟡 另一个写库任务正在进行中，本次更新没有开始（书库未改动）", fg="orange")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("更新"))
+            return
         self._busy = True
         self.status.config(text=f"正在比对《{b['书名']}》新旧版本…（界面可正常操作）", fg="orange")
-        self._task_id = taskcenter.start("更新", f"《{b['书名']}》")
+        self._task_id = tid
         taskcenter.progress(self._task_id, step="比对新旧版本（预演，不动书库）")
         taskcenter.log(self._task_id, f"新版文件：{path}")
         threading.Thread(target=self._update_dry_worker,
@@ -732,8 +794,16 @@ class 书库页(tk.Frame):
             self.status.config(text="已取消更新（书库未改动）。", fg="gray")
             self.refresh()
             return
+        tid = taskcenter.start("更新", f"《{title}》")
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self._busy = False
+            self.status.config(text="🟡 另一个写库任务正在进行中，本次更新没有执行（书库未改动）", fg="orange")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("更新"))
+            self.refresh()
+            return
         self.status.config(text=f"正在更新《{title}》…（界面可正常操作）", fg="orange")
-        self._task_id = taskcenter.start("更新", f"《{title}》")
+        self._task_id = tid
         taskcenter.progress(self._task_id, step="执行更新（自动备份＋校验）")
         threading.Thread(target=self._update_exec_worker,
                          args=(title, book_id, path, self._task_id), daemon=True).start()
@@ -845,9 +915,15 @@ class 书库页(tk.Frame):
             f"确定继续吗？"):
             return
 
+        tid = taskcenter.start("删除", f"《{title}》", total=6)
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self.status.config(text="🟡 另一个写库任务正在进行中，本次删除没有开始（书库未改动）", fg="orange")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("删除"))
+            return
         self._busy = True
         self.status.config(text=f"正在删除《{title}》…（界面可正常操作）", fg="orange")
-        self._task_id = taskcenter.start("删除", f"《{title}》", total=6)
+        self._task_id = tid
         taskcenter.progress(self._task_id, current=0, step="清理书库目录")
         threading.Thread(target=self._delete_worker, args=(title, b["书号"], self._task_id),
                          daemon=True).start()
@@ -927,9 +1003,11 @@ class 书库页(tk.Frame):
             pass
         # ⑥ 评测集删该书题行并题号重连（#56：书号复用串书根因——按书号收回该书评测题钥匙）
         _r("清理评测集")
-        pr = annotate_pack.purge_book_evals(book_id)
+        pr = annotate_pack.purge_book_evals(book_id, book_title=title)
         if pr["删除题数"]:
             removed.append(f"评测集 {pr['删除题数']} 题（其余题号接续）")
+        if pr.get("真实集删除题数"):
+            removed.append(f"真实提问评测集 {pr['真实集删除题数']} 题（其余题号接续）")
         return removed
 
     def _delete_worker(self, title, book_id, task_id):
@@ -1064,10 +1142,16 @@ class 书库页(tk.Frame):
         keys = tuple(sorted(f"{r['书号']}|{r['书名']}" for r in resid))
         if not resid or keys == self._auto_cleaned:
             return
-        self._auto_cleaned = keys
         self._auto_clean_running = True
         self._busy = True
         self._task_id = taskcenter.start("清理", f"共 {len(resid)} 本", total=len(resid))
+        if not self._task_id:
+            # #65 M1：写锁被占（多半是另一个控制台在写库）——自动清理静默跳过，
+            # 不弹窗打扰；不记「已清理」，下次刷新安静下来再自动试。
+            self._auto_clean_running = False
+            self._busy = False
+            return
+        self._auto_cleaned = keys
         taskcenter.progress(self._task_id, current=0, step="自动清理残留")
         taskcenter.log(self._task_id, f"检测到 {len(resid)} 本书的残留数据（书已不在书库，但有遗留文件和登记），自动清理："
                                       + "、".join(f"《{r['书名']}》" for r in resid))
@@ -1095,9 +1179,15 @@ class 书库页(tk.Frame):
                 "会清掉识别缓存、报告、核验产物、任务包和登记记录；"
                 "已入库的原始文件会移回 待入库（原件保留）。\n\n确定继续吗？"):
             return
+        tid = taskcenter.start("清理", f"共 {len(resid)} 本", total=len(resid))
+        if not tid:
+            # #65 M1：写锁被占——不启动后台 worker，人话提示（不抛栈、不冻结）
+            self.status.config(text="🟡 另一个写库任务正在进行中，本次清理没有开始（书库未改动）", fg="orange")
+            messagebox.showinfo("提示", taskcenter.lock_block_text("清理"))
+            return
         self._busy = True
         self.status.config(text=f"正在清理 {len(resid)} 本残留…（界面可正常操作）", fg="orange")
-        self._task_id = taskcenter.start("清理", f"共 {len(resid)} 本", total=len(resid))
+        self._task_id = tid
         taskcenter.progress(self._task_id, current=0, step="开始清理")
         threading.Thread(target=self._cleanup_worker, args=(resid, self._task_id),
                          daemon=True).start()

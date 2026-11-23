@@ -639,7 +639,10 @@ def _append_question_grams(eval_rows: list, kb_root: Path = None) -> list:
                 continue
             if book_id:
                 book_by_id.setdefault(book_id, d.name)
-    changed = set()
+    # #65 M3（设计 §4.6）：先按书归并题面 gram，再每书只读/写一次倒排表；旧实现逐题
+    # 整份解析并回写，62 道题会把同一本 13MB 倒排表解析/序列化 62 次。写入词条与块 ID
+    # 集合、幂等语义不变（同 gram 的块 ID 按块 ID 升序追加）。
+    grams_by_title = {}
     for r in eval_rows:
         answer = r["答案块ID"]
         if "·" not in answer:
@@ -651,6 +654,11 @@ def _append_question_grams(eval_rows: list, kb_root: Path = None) -> list:
         grams = _question_ngrams(r["提问"])
         if not grams:
             continue
+        per_book = grams_by_title.setdefault(title, {})
+        for g in grams:
+            per_book.setdefault(g, set()).add(answer)
+    changed = set()
+    for title, grams_of_book in grams_by_title.items():
         inv_path = kb_root / "书籍" / title / "倒排表.json"
         try:
             data = json.loads(inv_path.read_text(encoding="utf-8"))
@@ -658,13 +666,17 @@ def _append_question_grams(eval_rows: list, kb_root: Path = None) -> list:
             continue
         qg = data.setdefault("题干", {})
         added = False
-        for g in sorted(grams):
+        for g in sorted(grams_of_book):
             lst = qg.setdefault(g, [])
-            if answer not in lst:
-                lst.append(answer)
-                added = True
+            for answer in sorted(grams_of_book[g]):
+                if answer not in lst:
+                    lst.append(answer)
+                    added = True
         if added:
-            inv_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            # #65 M1：题干倒排写回走原子写，避免半截 JSON 损坏检索入口
+            # #65 M3：统一紧凑序列化，避免重建后又把倒排表重新格式化
+            common.atomic_write_text(
+                inv_path, common.dump_index_json(data), encoding="utf-8")
             changed.add(title)
     return sorted(changed)
 
@@ -673,6 +685,7 @@ def backfill_question_grams(kb_root: Path = None) -> dict:
     """存量补写入口（`--题干补写`）：读全局评测集全部题，题干 n-gram 写进各书「题干」节。
 
     幂等（_append_question_grams 去重），已写过的题重跑不产重复词条。不需要 --书名。
+    #65 M2：补写后清理指向不存在块的题干 posting，返回清理明细与计数。
     """
     if kb_root is None:
         kb_root = common.get_path("知识库")
@@ -688,10 +701,90 @@ def backfill_question_grams(kb_root: Path = None) -> dict:
         if len(cells) >= 3 and re.match(r"^Q?\d+$", cells[0]):
             rows.append({"题号": cells[0], "提问": cells[1], "答案块ID": cells[2]})
     changed = _append_question_grams(rows, kb_root)
-    return {"写入书数": len(changed), "题干题数": len(rows), "跳过": None}
+    maintenance = _prune_stale_question_grams(kb_root)
+    written = set(changed) | set(maintenance)
+    return {"写入书数": len(written), "题干题数": len(rows), "跳过": None,
+            "清理引用": sum(len(items) for items in maintenance.values()),
+            "清理详情": maintenance}
 
 
-def purge_book_evals(book_id: str, kb_root: Path = None) -> dict:
+def _prune_stale_question_grams(kb_root: Path = None) -> dict:
+    """#65 M2：按书清理题干节中指向不存在块的 posting，返回 {书名: 失效引用明细}。
+
+    活块以当前 原文.md 的块 ID 为准；只写确有失效引用的书，保持有效词条顺序。
+    """
+    import build_index
+    if kb_root is None:
+        kb_root = common.get_path("知识库")
+    maintenance = {}
+    for title, book_dir in search_keyword._iter_books(kb_root):
+        inv_path = book_dir / "倒排表.json"
+        if not inv_path.exists():
+            # #65 M3 补记：没有倒排表＝没有题干节可清，跳过即可；「存在但损坏」仍按 M1 口径
+            # 显式报错（不能把损坏当空表继续写）。此分支修复 A-06 原生 --自检 在
+            # 「有原文无索引」的假书上被 M1 显式错误打断（M2 引入的组合缺陷）。
+            continue
+        data = search_keyword._load_index(title, inv_path)
+        question = data.get("题干", {})
+        if question is None:
+            question = {}
+        if not isinstance(question, dict):
+            raise search_keyword._index_error(title, inv_path, "结构异常：「题干」节应为对象")
+        block_map, _orig, _copy = build_index._parse_book_files(title, kb_root)
+        cleaned, removed = build_index._prune_question_postings(
+            question, set(block_map), title, inv_path)
+        if not removed:
+            continue
+        if cleaned:
+            data["题干"] = cleaned
+        else:
+            data.pop("题干", None)
+        common.atomic_write_text(
+            inv_path, common.dump_index_json(data), encoding="utf-8")
+        maintenance[title] = removed
+    return maintenance
+
+
+def _purge_real_evals(book_id: str, kb_root: Path, book_title: str = None) -> int:
+    """#66：删书联动清理 评测集_真实提问.md 中该书题行并接续重编 R001..Rnnn。"""
+    real_path = kb_root / "评测集_真实提问.md"
+    if not real_path.exists():
+        return 0
+    prefix = f"{book_id}·" if book_id else None
+    lines = real_path.read_text(encoding="utf-8").split("\n")
+    kept, rows_at = [], []
+    removed = 0
+    for ln in lines:
+        s = ln.strip()
+        cells = None
+        if s.startswith("|") and not s.startswith("|---"):
+            cells = [c.strip() for c in s.strip("|").split("|")]
+        if cells and len(cells) >= 4 and re.match(r"^R\d+$", cells[0]):
+            scoped_book = cells[2].strip("《》 ").strip()
+            raw_bids = [b.strip() for b in re.split(r"[,，]", cells[3]) if b.strip()]
+            keep_bids = [b for b in raw_bids if not (prefix and b.startswith(prefix))]
+            book_matched = bool(book_title and scoped_book == book_title)
+            if book_matched or (raw_bids and not keep_bids):
+                removed += 1
+                continue
+            if prefix and len(keep_bids) != len(raw_bids):
+                cells[3] = ", ".join(keep_bids)
+                ln = "| " + " | ".join(cells) + " |"
+            rows_at.append(len(kept))
+        kept.append(ln)
+    if not removed:
+        return 0
+    for offset, idx in enumerate(rows_at):
+        cells = [c.strip() for c in kept[idx].strip().strip("|").split("|")]
+        new_no = f"R{offset + 1:03d}"
+        if cells[0] != new_no:
+            cells[0] = new_no
+            kept[idx] = "| " + " | ".join(cells) + " |"
+    common.atomic_write_text(real_path, "\n".join(kept), encoding="utf-8")
+    return removed
+
+
+def purge_book_evals(book_id: str, kb_root: Path = None, book_title: str = None) -> dict:
     """#56 删书联动：从全局评测集删掉该书的题行（答案块ID 以 `{书号}·` 开头），其余题号重连。
 
     根因：评测集是**跨书混合单文件**、按 `{书号}·{序号}` 答案块ID 关联；删书若不按书号删行，
@@ -702,11 +795,14 @@ def purge_book_evals(book_id: str, kb_root: Path = None) -> dict:
     既有偏移，不整体归零，避免冲击既有引用/基线）；表头、分组空行与未变题号行原样保留。
     幂等：无该书题行时原样返回，重跑结果一致。返回 {"删除题数", "剩余题数"}。
     """
-    result = {"删除题数": 0, "剩余题数": 0}
-    if not book_id:
+    result = {"删除题数": 0, "剩余题数": 0, "真实集删除题数": 0}
+    if not book_id and not book_title:
         return result
     if kb_root is None:
         kb_root = common.get_path("知识库")
+    result["真实集删除题数"] = _purge_real_evals(book_id, kb_root, book_title=book_title)
+    if not book_id:
+        return result
     eval_path = kb_root / "评测集.md"
     if not eval_path.exists():
         return result
@@ -756,6 +852,112 @@ def _chapter_page_range(blocks: list) -> str:
     start_txt = first if t1["降级"] else str(t1["起始"])
     end_txt = last if t2["降级"] else str(t2["结束"])
     return f"p.{start_txt}~p.{end_txt}"
+
+
+def _split_tags(tag_text: str) -> list:
+    return list(dict.fromkeys(
+        t.strip() for t in re.split(r"[,，、/]", tag_text or "") if t.strip()
+    ))
+
+
+def _save_block_tags(book_title: str, book_id: str, tag_rows: list,
+                     kb_root: Path = None) -> Path:
+    """#66：按块持久化 块标签.json（原子写，保留已有其他章节块标签）。"""
+    if kb_root is None:
+        kb_root = common.get_path("知识库")
+    book_dir = kb_root / "书籍" / book_title
+    tags_path = book_dir / "块标签.json"
+    data = {"书号": book_id, "来源": "AI标注", "块": {}}
+    if tags_path.exists():
+        try:
+            loaded = json.loads(tags_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and isinstance(loaded.get("块"), dict):
+                data["块"] = dict(loaded["块"])
+                if loaded.get("书号"):
+                    data["书号"] = loaded["书号"]
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"《{book_title}》的 块标签.json 损坏（{tags_path}）：{e}") from e
+    for row in tag_rows:
+        bid = str(row.get("块ID", "")).strip()
+        tags = _split_tags(row.get("标签", ""))
+        if bid and tags:
+            data["块"][bid] = tags
+    data["块"] = dict(sorted(data["块"].items()))
+    common.atomic_write_text(
+        tags_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return tags_path
+
+
+def recover_block_tags(book_title: str = None, kb_root: Path = None) -> dict:
+    """#66：从现存 任务包/{书名}/回填/*.md 无损回收块标签写 块标签.json（零 API 费用）。"""
+    if kb_root is None:
+        kb_root = common.get_path("知识库")
+    pack_root = common.get_path("输出") / "任务包"
+    if book_title:
+        targets = [book_title]
+    else:
+        targets = sorted(
+            d.name for d in pack_root.iterdir()
+            if d.is_dir() and (d / "回填").is_dir()
+        ) if pack_root.exists() else []
+
+    summary = {"回收书数": 0, "回收块数": 0, "跳过": [], "明细": {}}
+    for title in targets:
+        book_dir = kb_root / "书籍" / title
+        copy_path = book_dir / "检索副本.md"
+        orig_path = book_dir / "原文.md"
+        if not copy_path.exists() or not orig_path.exists():
+            summary["跳过"].append((title, "书库目录或原文缺失"))
+            continue
+        back_dir = pack_root / title / "回填"
+        if not back_dir.exists():
+            summary["跳过"].append((title, "无回填目录"))
+            continue
+        md_files = sorted(f for f in back_dir.glob("*.md") if not f.name.startswith("_"))
+        if not md_files:
+            summary["跳过"].append((title, "回填目录无 .md 文件"))
+            continue
+
+        # 单遍扫描现存活块ID与指纹，确保只收现存有效块且指纹匹配
+        live_fp = {}
+        book_id = ""
+        lines = copy_path.read_text(encoding="utf-8").split("\n")
+        cur_id, buf = None, []
+        for ln in lines:
+            m = search_keyword.BLOCK_ID_RE.match(ln.strip())
+            if m:
+                if cur_id is not None:
+                    live_fp[cur_id] = search_keyword.normalize(common.block_fingerprint(buf))
+                book_id = book_id or m.group(1)
+                cur_id = f"{m.group(1)}·{m.group(2)}"
+                buf = []
+            elif cur_id is not None:
+                buf.append(ln)
+        if cur_id is not None:
+            live_fp[cur_id] = search_keyword.normalize(common.block_fingerprint(buf))
+
+        collected = {}
+        for f in md_files:
+            parsed = _parse_filled(f.read_text(encoding="utf-8-sig"))
+            for row in parsed["标签行"]:
+                if row.get("列数") != 5:
+                    continue
+                bid = row["块ID"]
+                if bid not in live_fp:
+                    continue
+                if search_keyword.normalize(row["指纹"]) != live_fp[bid]:
+                    continue
+                tags = _split_tags(row["标签"])
+                if tags:
+                    collected[bid] = {"块ID": bid, "标签": ",".join(tags)}
+        if not collected:
+            summary["跳过"].append((title, "未解析到有效块标签"))
+            continue
+        _save_block_tags(title, book_id, list(collected.values()), kb_root)
+        summary["回收书数"] += 1
+        summary["回收块数"] += len(collected)
+        summary["明细"][title] = len(collected)
+    return summary
 
 
 def import_pack(book_title: str, chapter_no: str, sub: str = "",
@@ -873,6 +1075,9 @@ def import_pack(book_title: str, chapter_no: str, sub: str = "",
     summary_dir = book_dir / "章节摘要"
     summary_dir.mkdir(parents=True, exist_ok=True)
     (summary_dir / f"{chapter_no}.md").write_text("\n".join(summary_text), encoding="utf-8")
+
+    # ①-b #66：按块持久化 块标签.json（外发与 API 两通道同一落点）
+    _save_block_tags(book_title, chapter["书号"], merged_tag_rows, kb_root)
 
     # ② 术语候选 → 输出\验证\{书名}_术语候选.json（与既有候选合并，避免互相覆盖）
     term_candidates = []
@@ -1564,6 +1769,8 @@ def main():
             mode = "术语配对"
         elif a == "--题干补写":
             mode = "题干补写"
+        elif a == "--回收块标签":
+            mode = "回收块标签"
         elif a == "--书名" and i + 1 < len(args):
             book_title = args[i + 1]
         elif a == "--章号" and i + 1 < len(args):
@@ -1572,9 +1779,9 @@ def main():
             sub = args[i + 1]
         elif a == "--文件" and i + 1 < len(args):
             filled_path = args[i + 1]
-    usage = ("用法：python annotate_pack.py --生成|--生成全书|--导回|--导回全书|--删除|--自动回填|--术语配对|--题干补写 "
+    usage = ("用法：python annotate_pack.py --生成|--生成全书|--导回|--导回全书|--删除|--自动回填|--术语配对|--题干补写|--回收块标签 "
              "--书名 <书名> [--章号 <章号>] [--子包 <a|b|...>] [--文件 <回填文件>]")
-    if not book_title and mode != "题干补写":
+    if not book_title and mode not in ("题干补写", "回收块标签"):
         print(usage)
         sys.exit(1)
     try:
@@ -1665,6 +1872,16 @@ def main():
                 print(f"🟡 {r['跳过']}")
                 sys.exit(1)
             print(f"✅ 题干补写完成：{r['题干题数']} 道题 → {r['写入书数']} 本书倒排表「题干」节（幂等，重跑不重复）")
+            if r["清理引用"]:
+                print(f"🟡 同时清理题干失效引用 {r['清理引用']} 条（仅索引入口，未改评测集）")
+            sys.exit(0)
+        elif mode == "回收块标签":
+            r = recover_block_tags(book_title)
+            print(f"✅ 块标签回收完成：{r['回收书数']} 本书、共 {r['回收块数']} 块（零 API 费用）")
+            for t, cnt in r["明细"].items():
+                print(f"  - 《{t}》：{cnt} 块")
+            for t, reason in r["跳过"]:
+                print(f"  ⏭️ 《{t}》跳过：{reason}")
             sys.exit(0)
         else:
             print(usage)
@@ -2290,6 +2507,52 @@ def _selfcheck():
             ok = False
         else:
             print("  ✅ ⑮ R4 题干入倒排：写入 1 书、旧题跳过、重跑幂等")
+        d1["失效入口"] = ["自检01·9999"]
+        d1["混合入口"] = ["自检01·0001", "自检01·9999"]
+        data15 = json.loads(inv_self.read_text(encoding="utf-8"))
+        data15["题干"] = d1
+        inv_self.write_text(json.dumps(data15, ensure_ascii=False, indent=2), encoding="utf-8")
+        maintenance15 = _prune_stale_question_grams(fake_kb)
+        cleaned15 = json.loads(inv_self.read_text(encoding="utf-8"))["题干"]
+        if "失效入口" not in cleaned15 and cleaned15["混合入口"] == ["自检01·0001"] \
+                and sum(len(v) for v in maintenance15.values()) == 2:
+            print("  ✅ #65 M2 题干失效引用清理：退休词条移除、活块保留")
+        else:
+            print(f"  ❌ #65 M2 题干失效引用清理异常：{maintenance15} {cleaned15}")
+            ok = False
+
+        # ⑯ #66 阶段 3：import_pack 持久化 块标签.json + 回收块标签 + 真实集删书联动清理
+        bt_path = book_dir / "块标签.json"
+        if not bt_path.exists():
+            print("  ❌ #66 import_pack 未生成 块标签.json")
+            ok = False
+        else:
+            bt_data = json.loads(bt_path.read_text(encoding="utf-8"))
+            if "自检01·0001" not in bt_data.get("块", {}):
+                print(f"  ❌ #66 块标签.json 缺少块条目：{bt_data}")
+                ok = False
+            else:
+                bt_path.unlink()
+                rec = recover_block_tags("自检书", fake_kb)
+                if rec["回收块数"] < 2 or not bt_path.exists():
+                    print(f"  ❌ #66 recover_block_tags 回收失败：{rec}")
+                    ok = False
+                else:
+                    print(f"  ✅ #66 块标签持久化与回填无损回收：{rec['回收块数']} 块")
+        real_eval = fake_kb / "评测集_真实提问.md"
+        real_eval.write_text(
+            "# 评测集 · 真实提问\n\n| 题号 | 提问（用户原话） | 限定书 | 答案块ID | 确认人 |\n"
+            "|---|---|---|---|---|\n"
+            "| R001 | 自检问 | 自检书 | 自检01·0001 | 测试 |\n"
+            "| R002 | 他书问 | 他书 | 自检02·0001 | 测试 |\n",
+            encoding="utf-8")
+        pr_real = purge_book_evals("自检01", fake_kb, book_title="自检书")
+        real_after = real_eval.read_text(encoding="utf-8")
+        if pr_real["真实集删除题数"] != 1 or "自检01·0001" in real_after or "| R001 | 他书问 |" not in real_after:
+            print(f"  ❌ #66 真实集删书联动清理异常：{pr_real}\n{real_after}")
+            ok = False
+        else:
+            print("  ✅ #66 真实集删书联动清理与题号接续正常")
 
         print(f"  {'✅ 通过' if ok else '❌ 失败'}")
         sys.exit(0 if ok else 1)
@@ -2314,4 +2577,4 @@ if __name__ == "__main__":
     if common.is_selfcheck():
         _selfcheck()
     else:
-        main()
+        common.run_with_write_lock(main, "标注")

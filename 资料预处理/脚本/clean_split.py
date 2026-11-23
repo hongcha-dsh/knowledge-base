@@ -431,9 +431,10 @@ def clean_split(book_id: str, book_title: str) -> tuple:
         iso_dir = cache_dir / "隔离区"
         segments_fit, state_fit = page_fit.fit_segments(page_fit.harvest_anchors(iso_dir))
         book_dir.mkdir(parents=True, exist_ok=True)
-        (book_dir / "页码映射.json").write_text(
+        common.atomic_write_text(
+            book_dir / "页码映射.json",
             json.dumps(page_fit.build_page_map(book_id, state_fit, segments_fit),
-                       ensure_ascii=False, indent=2), encoding="utf-8")
+                       ensure_ascii=False, indent=2))
         if state_fit == "降级":
             yellows.append("页码无法自动识别：引用位置将按 PDF 文件页数标注，与书上印刷页码可能不一致；不影响检索，无需处理。")
 
@@ -483,18 +484,18 @@ def clean_split(book_id: str, book_title: str) -> tuple:
 
     # 写入知识库（原文 + 检索副本 + 图表块清单 + 隔离区.md）
     book_dir.mkdir(parents=True, exist_ok=True)
-    (book_dir / "原文.md").write_text(orig_text, encoding="utf-8")
-    (book_dir / "检索副本.md").write_text(copy_text, encoding="utf-8")
-    (book_dir / "隔离区.md").write_text("\n".join(iso_md) + "\n", encoding="utf-8")
-    (book_dir / "图表块清单.json").write_text(
-        json.dumps({"图表块": chart_ids}, ensure_ascii=False, indent=2), encoding="utf-8")
+    common.atomic_write_text(book_dir / "原文.md", orig_text)
+    common.atomic_write_text(book_dir / "检索副本.md", copy_text)
+    common.atomic_write_text(book_dir / "隔离区.md", "\n".join(iso_md) + "\n")
+    common.atomic_write_text(book_dir / "图表块清单.json",
+                            json.dumps({"图表块": chart_ids}, ensure_ascii=False, indent=2))
     (book_dir / "章节摘要").mkdir(exist_ok=True)
     # #20 成品 结构.json：只供 build_index 章节识别候选，不进倒排/任务包/检索视野
     if signals:
         struct_path = book_dir / "结构.json"
         if structure_entries:
-            struct_path.write_text(
-                json.dumps(structure_entries, ensure_ascii=False, indent=2), encoding="utf-8")
+            common.atomic_write_text(
+                struct_path, json.dumps(structure_entries, ensure_ascii=False, indent=2))
         elif struct_path.exists():
             struct_path.unlink()
 
@@ -904,4 +905,4 @@ if __name__ == "__main__":
     if common.is_selfcheck():
         _selfcheck()
     else:
-        main()
+        common.run_with_write_lock(main, "清洗分块")

@@ -12,6 +12,7 @@
 异常：块 ID 重复→报"块 ID 冲突"；指纹为空→报该块"无正文"
 """
 
+import hashlib
 import json
 import re
 import sys
@@ -83,6 +84,21 @@ def _parse_book_files(book_title: str, kb_root: Path = None) -> tuple:
     return block_map, orig_lines, copy_lines
 
 
+def _file_sha256(path: Path) -> str:
+    """文件级 SHA-256（分块读，避免整本原文一次进内存）。#65 M4 完整性清单用。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _block_sha256(orig_lines: list, blk: dict) -> str:
+    """整块正文 SHA-256：块 ID 行之后到下一块 ID 行之前，逐字（含空行）拼接后取哈希。"""
+    text = "\n".join(orig_lines[blk["起始行"] + 1: blk["结束行"] + 1])
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _ngrams(text: str) -> set:
     """生成 2/3 字 n-gram（只取中文+字母数字字符）。"""
     chars = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", text)
@@ -91,6 +107,67 @@ def _ngrams(text: str) -> set:
         for i in range(len(chars) - n + 1):
             grams.add(chars[i : i + n])
     return grams
+
+
+def _load_and_prune_block_tags(book_dir: Path, live_ids: set,
+                                 book_title: str) -> tuple:
+    """#66：读取 块标签.json，剔除已退休/不存在块并回写；返回 (导航节 dict, 清理块列表)。"""
+    tags_path = book_dir / "块标签.json"
+    if not tags_path.exists():
+        return {}, []
+    try:
+        data = json.loads(tags_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise RuntimeError(
+            f"块标签文件损坏：书《{book_title}》文件 {tags_path}：{e}。"
+            f"请修复或重新导回/回收块标签后重跑 A-04。") from e
+    if not isinstance(data, dict) or not isinstance(data.get("块"), dict):
+        raise RuntimeError(
+            f"块标签结构异常：书《{book_title}》文件 {tags_path} 缺少「块」对象。")
+    raw_blocks = data["块"]
+    live_blocks = {}
+    removed = []
+    for bid, tags in raw_blocks.items():
+        if bid not in live_ids:
+            removed.append(bid)
+            continue
+        if isinstance(tags, list):
+            live_blocks[bid] = [str(t).strip() for t in tags if str(t).strip()]
+    if removed:
+        data["块"] = dict(sorted(live_blocks.items()))
+        common.atomic_write_text(
+            tags_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    nav = {}
+    for bid, tags in live_blocks.items():
+        block_grams = set()
+        for t in tags:
+            norm = common.normalize_for_search(t)
+            if norm:
+                block_grams.update(_ngrams(norm))
+        for g in block_grams:
+            nav.setdefault(g, []).append(bid)
+    return dict(sorted(nav.items())), removed
+
+
+def _prune_question_postings(question: dict, live_ids: set,
+                             book_title: str, index_path: Path) -> tuple:
+    """保留仍指向活在库块的题干 posting，返回 (清理后题干节, 失效引用明细)。
+
+    只清索引入口，不改评测集；词条及活块顺序保持原样。结构损坏显式拒绝，
+    不把坏数据当成空题干节继续写。
+    """
+    cleaned, removed = {}, []
+    for gram, postings in question.items():
+        if not isinstance(postings, list) or any(not isinstance(bid, str) for bid in postings):
+            raise RuntimeError(
+                f"旧倒排表「题干」节 posting 损坏：书《{book_title}》文件 {index_path}，"
+                f"词条 {gram!r}。请修复或从备份恢复后重试。")
+        kept = [bid for bid in postings if bid in live_ids]
+        removed.extend({"词条": gram, "块ID": bid} for bid in postings if bid not in live_ids)
+        if kept:
+            cleaned[gram] = kept
+    return cleaned, removed
 
 
 def _load_chart_ids(book_dir: Path) -> set:
@@ -321,20 +398,44 @@ def build_index(book_id: str, book_title: str, kb_root: Path = None) -> dict:
         if bid in chart_ids:
             continue
         text = "".join(blk["正文"])
+        # #65 M3（设计 §4.6）：_ngrams 返回 set（块内 gram 必然唯一），posting 里按块循环
+        # 逐块追加天然不重复，删除原来的「块 ID 已在列表中」逐个线性查找；产物对象等价。
         for g in _ngrams(text):
-            inverted.setdefault(g, [])
-            if bid not in inverted[g]:
-                inverted[g].append(bid)
+            posting = inverted.get(g)
+            if posting is None:
+                inverted[g] = [bid]
+            else:
+                posting.append(bid)
 
     # #4 M3（R4）：保留既有「题干」词条——原文重建不覆盖题干检索入口（独立节、幂等）
+    # #65 M1：旧倒排存在但损坏时必须显式报错（含书名/文件/修复建议），不得静默清空「题干」节
     prev_question = {}
     prev_inv = book_dir / "倒排表.json"
     if prev_inv.exists():
         try:
-            prev_question = json.loads(prev_inv.read_text(encoding="utf-8")).get("题干", {}) or {}
-        except Exception:
+            prev_data = json.loads(prev_inv.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise RuntimeError(
+                f"旧倒排表损坏，拒绝重建（避免静默丢失「题干」检索入口）："
+                f"书《{book_title}》({book_id}) 文件 {prev_inv}：{e}。"
+                f"请修复该 JSON 或从备份恢复后重跑 A-04。") from e
+        if not isinstance(prev_data, dict):
+            raise RuntimeError(
+                f"旧倒排表结构损坏（顶层不是 JSON 对象），拒绝重建（避免静默丢失「题干」检索入口）："
+                f"书《{book_title}》({book_id}) 文件 {prev_inv}。请修复或从备份恢复后重跑 A-04。")
+        prev_question = prev_data.get("题干")
+        if prev_question is None:
             prev_question = {}
+        elif not isinstance(prev_question, dict):
+            raise RuntimeError(
+                f"旧倒排表「题干」节结构损坏（不是 JSON 对象），拒绝重建（避免静默丢失题干检索入口）："
+                f"书《{book_title}》({book_id}) 文件 {prev_inv}。请修复或从备份恢复后重跑 A-04。")
 
+    # #65 M2：保留有效题干入口，同时清掉更新/退休后已不存在块的引用。
+    live_ids = set(block_map)
+    prev_question, question_removed = _prune_question_postings(
+        prev_question, live_ids, book_title, prev_inv)
+    nav_index, nav_removed = _load_and_prune_block_tags(book_dir, live_ids, book_title)
     index_data = {
         "书号": book_id,
         "构建时间": date.today().isoformat(),
@@ -342,9 +443,11 @@ def build_index(book_id: str, book_title: str, kb_root: Path = None) -> dict:
     }
     if prev_question:
         index_data["题干"] = prev_question
-    (book_dir / "倒排表.json").write_text(
-        json.dumps(index_data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    if nav_index:
+        index_data["导航"] = nav_index
+    common.atomic_write_text(
+        book_dir / "倒排表.json",
+        common.dump_index_json(index_data), encoding="utf-8")
 
     # 目录骨架（#20：结构信号优先 + 章级过滤；无信号/过滤后空 → 启发式兜底）
     chapters, chapter_channel = _detect_chapters(block_map, orig_lines, book_dir)
@@ -362,7 +465,23 @@ def build_index(book_id: str, book_title: str, kb_root: Path = None) -> dict:
     for ch, name, s_bid, e_bid in chapters:
         n_blocks = bid_pos[e_bid] - bid_pos[s_bid] + 1
         skeleton.append(f"| {ch} | {name} | {s_bid} | {n_blocks} |")
-    (book_dir / "目录骨架.md").write_text("\n".join(skeleton) + "\n", encoding="utf-8")
+    common.atomic_write_text(
+        book_dir / "目录骨架.md", "\n".join(skeleton) + "\n", encoding="utf-8")
+
+    # #65 M4（设计 §4.8.4）：整块 SHA-256 + 文件完整性清单，作强校验。
+    # 既有 12 字短指纹（任务包指纹列）保持不变——短指纹不是唯一 ID，也不冒充唯一 ID。
+    integrity = {
+        "书号": book_id,
+        "生成时间": date.today().isoformat(),
+        "原文SHA256": _file_sha256(book_dir / "原文.md"),
+        "检索副本SHA256": _file_sha256(book_dir / "检索副本.md"),
+        "块数": len(block_map),
+        "块SHA256": {bid: _block_sha256(orig_lines, blk)
+                     for bid, blk in block_map.items()},
+    }
+    common.atomic_write_text(
+        book_dir / "完整性清单.json",
+        common.dump_index_json(integrity), encoding="utf-8")
 
     # 锚点映射（参考格式，存提取缓存）
     anchor_map = {}
@@ -378,9 +497,9 @@ def build_index(book_id: str, book_title: str, kb_root: Path = None) -> dict:
         }
     cache_dir = common.get_path("输出") / "提取缓存" / book_id
     cache_dir.mkdir(parents=True, exist_ok=True)
-    (cache_dir / "锚点映射.json").write_text(
-        json.dumps(anchor_map, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    common.atomic_write_text(
+        cache_dir / "锚点映射.json",
+        json.dumps(anchor_map, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 书目总索引登记
     update_catalog(book_title, book_id, len(block_map), page_range, kb_root)
@@ -393,6 +512,9 @@ def build_index(book_id: str, book_title: str, kb_root: Path = None) -> dict:
         "倒排条目数": len(inverted),
         "页码范围": page_range,
         "章节识别": chapter_channel,
+        "题干清理": question_removed,
+        "导航清理": nav_removed,
+        "导航条目数": len(nav_index),
     }
 
 
@@ -463,7 +585,7 @@ def _write_catalog(path: Path, title: str, rows: list):
     """统一出口：标题 + 空行 + 表头 + 分隔 + 数据行（不产生多余空行）。"""
     out = [title, "", CATALOG_HEADER, CATALOG_SEP]
     out += ["| " + " | ".join(r) + " |" for r in rows]
-    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    common.atomic_write_text(path, "\n".join(out) + "\n", encoding="utf-8")
 
 
 def catalog_get_category(book_id: str, kb_root: Path = None) -> str:
@@ -643,7 +765,12 @@ def _selfcheck():
             ok = False
 
         info = build_index("自检01", "自检书", fake_kb)
-        index = json.loads((book_dir / "倒排表.json").read_text(encoding="utf-8"))
+        raw_inv = (book_dir / "倒排表.json").read_text(encoding="utf-8")
+        index = json.loads(raw_inv)
+        # #65 M3：倒排表统一紧凑序列化（ensure_ascii=False + separators），不得再带缩进换行
+        if "\n" in raw_inv:
+            print("  ❌ #65 M3 倒排表不是紧凑格式（仍含换行缩进）")
+            ok = False
         hits = index["条目"].get("排龙")
         if not hits:
             print("  ❌ 倒排表查不到 '排龙'")
@@ -654,6 +781,20 @@ def _selfcheck():
         if index["条目"].get("海中") or index["条目"].get("纳音"):
             print(f"  ❌ 图表块 0005 进了倒排表：{index['条目'].get('海中') or index['条目'].get('纳音')}")
             ok = False
+        integ = json.loads((book_dir / "完整性清单.json").read_text(encoding="utf-8"))
+        b1 = _parse_book_files("自检书", fake_kb)[0]["自检01·0001"]
+        orig_ck = (book_dir / "原文.md").read_text(encoding="utf-8").split("\n")
+        want_h = hashlib.sha256(
+            "\n".join(orig_ck[b1["起始行"] + 1: b1["结束行"] + 1]
+                      ).encode("utf-8")).hexdigest()
+        if (integ.get("块数") != 5 or len(integ.get("块SHA256", {})) != 5
+                or len(integ.get("原文SHA256", "")) != 64
+                or integ["块SHA256"].get("自检01·0001") != want_h):
+            print(f"  ❌ #65 M4 完整性清单异常：块数={integ.get('块数')} "
+                  f"条目={len(integ.get('块SHA256', {}))}")
+            ok = False
+        else:
+            print("  ✅ #65 M4 完整性清单：块级 SHA-256 与文件哈希齐全")
         skeleton = (book_dir / "目录骨架.md").read_text(encoding="utf-8")
         if "| 章号 | 章名 | 起始块ID | 块数 |" not in skeleton:
             ok = False
@@ -796,15 +937,39 @@ def _selfcheck():
         # #4 M3（R4）：重建倒排表保留既有「题干」节（原文重建不覆盖题干检索入口）
         inv_p = book_dir / "倒排表.json"
         data_pre = json.loads(inv_p.read_text(encoding="utf-8"))
-        data_pre["题干"] = {"吉凶祸福": ["自检01·0005"]}
+        data_pre["题干"] = {"吉凶祸福": ["自检01·0005"],
+                            "失效入口": ["自检01·9999"],
+                            "混合入口": ["自检01·0005", "自检01·9999"]}
         inv_p.write_text(json.dumps(data_pre, ensure_ascii=False, indent=2), encoding="utf-8")
-        build_index("自检01", "自检书", fake_kb)
+        info_q = build_index("自检01", "自检书", fake_kb)
         data_post = json.loads(inv_p.read_text(encoding="utf-8"))
-        if data_post.get("题干") != {"吉凶祸福": ["自检01·0005"]}:
-            print(f"  ❌ #4 M3 重建后「题干」节丢失：{data_post.get('题干')}")
+        expect_q = {"吉凶祸福": ["自检01·0005"], "混合入口": ["自检01·0005"]}
+        if data_post.get("题干") != expect_q or len(info_q["题干清理"]) != 2:
+            print(f"  ❌ #65 M2 题干保留/失效清理异常：{data_post.get('题干')}；"
+                  f"清理={info_q['题干清理']}")
             ok = False
         else:
-            print("  ✅ #4 M3 重建保留「题干」节（R4 检索入口不丢）")
+            print("  ✅ #4 M3 保留有效题干；#65 M2 清理 2 条失效引用")
+
+        # #66 阶段 3：块标签.json 写入「导航」节并同步清理退休块
+        tags_p = book_dir / "块标签.json"
+        tags_p.write_text(json.dumps({
+            "书号": "自检01", "来源": "AI标注",
+            "块": {
+                "自检01·0001": ["著书缘起", "总纲导言"],
+                "自检01·9999": ["退休废标签"],
+            },
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        info_nav = build_index("自检01", "自检书", fake_kb)
+        data_nav = json.loads(inv_p.read_text(encoding="utf-8"))
+        tags_after = json.loads(tags_p.read_text(encoding="utf-8"))["块"]
+        if "导航" not in data_nav or "著书" not in data_nav["导航"] \
+                or "退休" in data_nav["导航"] or "自检01·9999" in tags_after \
+                or info_nav["导航清理"] != ["自检01·9999"]:
+            print(f"  ❌ #66 导航节构建/退休清理异常：{info_nav} / {data_nav.get('导航')}")
+            ok = False
+        else:
+            print("  ✅ #66 导航节构建与块标签退休清理正常")
         print(f"  build_index 自检：{info['块数']} 块，{info['章节数']} 章，倒排条目 {info['倒排条目数']}")
         print(f"  {'✅ 通过' if ok else '❌ 失败'}")
         sys.exit(0 if ok else 1)
@@ -827,4 +992,4 @@ if __name__ == "__main__":
     if common.is_selfcheck():
         _selfcheck()
     else:
-        main()
+        common.run_with_write_lock(main, "建索引")

@@ -21,14 +21,15 @@ M3（手术，设计 §3.2 ⑤⑥）：整书快照备份（输出\迁移备份_
 保留块原文切片逐字节零触碰证明；块级只断言领号合法（max+1 起连续）。
 
 报告：《更新方案》始终落盘（#14 例外，用户确认凭据）；《更新对账》按 #14 口径
-红灯才落盘（附销单指引），转绿自动清除同名旧报告。
-运行中勿强杀进程（配置改写窗口内强杀会留下沙箱态配置）。
+红/黄灯才落盘（附销单指引），转绿且无后续事项时自动清除同名旧报告。
+运行中勿强杀进程（多步写盘被腰斩可能留下不完整数据；真实配置已不再改写）。
 
 退出码：0=成功（或无变化全保留）；2=dry-run 有变化待确认；1=失败（已回滚）。
 设计依据：项目文档\未来模块规划\2026-09-16-#21-书籍更新功能-design.md §3.2/§四/§六/§七。
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -156,26 +157,30 @@ def affected_chapters(result: dict, retired_ids: list, modified_ids: list) -> li
 
 @contextmanager
 def sandbox_ctx():
-    """e2e 同款沙箱：临时改写 路径配置.json 沙箱键（`SANDBOX_KEYS`：#43 起含 已入库）
-    → finally 恢复并销毁。
+    """#65 沙箱：以环境变量选择临时配置副本，真实 路径配置.json 不写（`SANDBOX_KEYS`：#43 起含 已入库）
+    → finally 恢复环境并销毁。
 
-    with 块内 common.get_path()/子进程读到的都是沙箱路径；
-    异常或强杀外层 KeyboardInterrupt 以外的正常异常都会走 finally 恢复。
+    with 块内 common.get_path()/子进程均读取临时配置副本。
+    正常返回或异常均恢复调用前环境。
     """
-    cfg_path = common.PROJECT_ROOT / "路径配置.json"
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    real_cfg_path = common.PROJECT_ROOT / "路径配置.json"
+    cfg = json.loads(real_cfg_path.read_text(encoding="utf-8"))
     keys = [k for k in SANDBOX_KEYS if k in cfg]
-    saved = {k: cfg[k] for k in keys}
     sandbox = Path(tempfile.mkdtemp(prefix="update_dry_"))
-    for key in keys:
-        (sandbox / key).mkdir(parents=True, exist_ok=True)
-        cfg[key] = str(sandbox / key)
-    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    previous = os.environ.get(common.CONFIG_PATH_ENV)
     try:
+        for key in keys:
+            (sandbox / key).mkdir(parents=True, exist_ok=True)
+            cfg[key] = str(sandbox / key)
+        sandbox_cfg = sandbox / "路径配置.json"
+        common.atomic_write_text(sandbox_cfg, json.dumps(cfg, ensure_ascii=False, indent=2))
+        os.environ[common.CONFIG_PATH_ENV] = str(sandbox_cfg)
         yield sandbox
     finally:
-        cfg.update(saved)
-        cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        if previous is None:
+            os.environ.pop(common.CONFIG_PATH_ENV, None)
+        else:
+            os.environ[common.CONFIG_PATH_ENV] = previous
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
@@ -243,7 +248,7 @@ def _sandbox_run(new_file: Path, book_id: str, book_title: str, full: bool = Fal
                     f"沙箱 {label} 步骤失败（退出码 {code}）\n{tail}\n"
                     f"{'=' * 30} 沙箱报告 {'=' * 30}\n{detail}")
 
-        # 新块序列解析（沙箱知识库；恢复配置前读入内存，带双行流供段级展开）
+        # 新块序列解析（沙箱知识库；退出沙箱前读入内存，带双行流供段级展开）
         kb_sandbox = sandbox / "知识库"
         new_blocks = load_blocks_with_lines(book_title, kb_sandbox, new_mode=True)
         pathb_lines = None
@@ -260,6 +265,30 @@ def sandbox_dry_run(new_file: Path, book_id: str, book_title: str) -> tuple:
 
 
 # ---------------------------------------------------------------- 手术执行（M3）
+
+UPDATE_GUARD_FILE = "更新保护.json"
+
+
+def mark_update_guard(book_dir: Path, *, success: bool = False) -> Path:
+    """在正文手术前建立永久保护；失败回滚后也保留，防旧缓存重排。"""
+    path = book_dir / UPDATE_GUARD_FILE
+    data = {"版本": 1, "保护": "禁止旧缓存重排", "最近成功": None}
+    if path.exists():
+        try:
+            old = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(old, dict):
+                raise ValueError("根节点不是对象")
+            data.update(old)
+        except Exception as e:
+            raise RuntimeError(f"更新保护标记损坏，请先人工检查：{path}（{e}）") from e
+    now = datetime.now().isoformat(timespec="seconds")
+    data["版本"] = 1
+    data["保护"] = "禁止旧缓存重排"
+    data["最近手术尝试"] = now
+    if success:
+        data["最近成功"] = now
+    return common.atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
 
 BID_LINE_RE = re.compile(r"^【([^·]+·\d{4})】p\.")  # 块 ID 行（捕获块ID；隔离区 ⟦⟧ 行不匹配）
 
@@ -347,11 +376,12 @@ def write_retire_registry(book_dir: Path, entries: list):
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            data.setdefault("退休块", [])
-        except Exception:
-            data = {"退休块": []}
+            if not isinstance(data, dict) or not isinstance(data.get("退休块"), list):
+                raise ValueError("根节点或退休块列表格式不正确")
+        except Exception as e:
+            raise RuntimeError(f"退休登记册损坏，拒绝从空表续写：{path}（{e}）") from e
     data["退休块"].extend(entries)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    common.atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _retire_entries(result: dict, seg_res: dict, cls: dict, plan: list, new_ids: list) -> list:
@@ -443,7 +473,7 @@ def _rollback(book_dir: Path, snapshot: Path, kb_root: Path, cat_text):
         shutil.rmtree(book_dir)
     shutil.copytree(snapshot, book_dir)
     if cat_text is not None:
-        (kb_root / "书目总索引.md").write_text(cat_text, encoding="utf-8")
+        common.atomic_write_text(kb_root / "书目总索引.md", cat_text)
 
 
 def _chapters_of_new_blocks(book_title: str, kb_root: Path, new_bids: list) -> set:
@@ -510,7 +540,7 @@ def rebase_structure_json(book_id: str, book_title: str, kb_root: Path,
         out.append(e)
     struct_path = book_dir / "结构.json"
     if out:
-        struct_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        common.atomic_write_text(struct_path, json.dumps(out, ensure_ascii=False, indent=2))
     elif struct_path.exists():
         struct_path.unlink()
     return {"总数": len(signals), "条目": len(out), "变更": changed, "丢失": len(failed)}
@@ -577,12 +607,15 @@ def execute(book_id: str, new_file: Path, threshold: float = block_diff.DEFAULT_
     cls = block_diff._classify(old_blocks, old_paras, new_paras, seg_res)
     max_old_no = max(int(b["块ID"].split("·")[1]) for b in old_blocks)
 
+    # #65 M1：必须在首次正文变更前建立保护；快照也带上标记，回滚后保护仍在。
+    mark_update_guard(book_dir)
     snapshot, cat_text = _snapshot_book(book_dir, kb_root)
     print(f"整书快照：{snapshot}")
+    print("更新保护：此后重建索引不再从旧缓存重排正文")
     try:
         orig_lines, copy_lines = assemble_book(plan, old_raw, new_ids)
-        (book_dir / "原文.md").write_text("\n".join(orig_lines), encoding="utf-8")
-        (book_dir / "检索副本.md").write_text("\n".join(copy_lines), encoding="utf-8")
+        common.atomic_write_text(book_dir / "原文.md", "\n".join(orig_lines))
+        common.atomic_write_text(book_dir / "检索副本.md", "\n".join(copy_lines))
         entries = _retire_entries(result, seg_res, cls, plan, new_ids)
         if entries:
             write_retire_registry(book_dir, entries)
@@ -595,8 +628,12 @@ def execute(book_id: str, new_file: Path, threshold: float = block_diff.DEFAULT_
                   f"／匹配丢失 {rb['丢失']}）")
         info = build_index.build_index(book_id, book_title, kb_root)
         print(f"A-04 重建：{info['块数']} 块 / {info['章节数']} 章（章节识别：{info['章节识别']}）")
+        if info["题干清理"]:
+            print(f"题干索引：清理失效引用 {len(info['题干清理'])} 条（明细见更新对账报告）")
         ok, details = reconcile(orig_lines, pathb_lines, result["保留"],
                                 old_raw, new_ids, max_old_no)
+        if ok:
+            mark_update_guard(book_dir, success=True)
     except Exception as e:
         _rollback(book_dir, snapshot, kb_root, cat_text)
         common.write_report(
@@ -611,6 +648,16 @@ def execute(book_id: str, new_file: Path, threshold: float = block_diff.DEFAULT_
     if ok:
         common.clear_report(f"{book_title}_更新对账.md")
         print("结论：🟢 双路径互证对账通过，更新已落库")
+        post_sections = []
+        if info["题干清理"]:
+            # #65 M2：失效入口已自动清理，但对应旧评测题仍需重标/迁移，不能静默销单。
+            removed_lines = [f"- 词条「{item['词条']}」→ 失效块「{item['块ID']}」"
+                             for item in info["题干清理"]]
+            post_sections.append(
+                "## 题干索引失效引用清理\n"
+                "以下入口已在 A-04 重建时自动移除；未改原文与评测集。"
+                "指向这些失效块的旧评测题仍需随变化章重标或人工迁移：\n"
+                + "\n".join(removed_lines))
         # M4：变化章「待重标」（对账绿灯后执行，不参与回滚；只产变化章任务包）
         affected = set(affected_chapters(assets, list(result["退休块"]),
                                          [b for b, _ in result["修改块"]]))
@@ -630,14 +677,19 @@ def execute(book_id: str, new_file: Path, threshold: float = block_diff.DEFAULT_
                 if missing:
                     print(f"🟡 变化章在新骨架中已不存在（跳过重标）：{', '.join(missing)}")
             except Exception as e:
-                common.write_report(
-                    f"{book_title}_更新对账.md",
-                    f"# 《{book_title}》更新对账\n结论：🟡 手术与对账均已通过（**库已更新**），"
-                    f"仅「变化章待重标」未完成\n原因：{e}\n"
-                    f"待重标章：{', '.join(sorted(affected))}\n\n"
-                    f"处理建议：重跑同一次更新（幂等，全保留直接退出 0 并自动清除本报告），"
-                    f"或手动重新生成上述章的任务包后重新标注。\n")
+                post_sections.append(
+                    "## 变化章待重标未完成\n"
+                    f"原因：{e}\n待重标章：{', '.join(sorted(affected))}\n\n"
+                    "处理建议：重跑同一次更新，或手动重新生成上述章的任务包后重新标注。")
                 print(f"🟡 变化章待重标未完成（库已更新，详见 报告\\{book_title}_更新对账.md）：{e}")
+        if post_sections:
+            common.write_report(
+                f"{book_title}_更新对账.md",
+                f"# 《{book_title}》更新对账\n"
+                "结论：🟡 手术与对账均已通过（**库已更新**），后续事项见下文\n\n"
+                + "\n\n".join(post_sections) + "\n")
+            if info["题干清理"]:
+                print(f"🟡 题干失效引用已清理并列明：报告\\{book_title}_更新对账.md")
         return 0
     _rollback(book_dir, snapshot, kb_root, cat_text)
     common.write_report(
@@ -809,7 +861,8 @@ def main():
         sys.exit(1)
 
     try:
-        sys.exit(dry_run(book_id, nf) if dry else execute(book_id, nf))
+        with common.exclusive_write_lock("更新 dry-run" if dry else "更新"):
+            sys.exit(dry_run(book_id, nf) if dry else execute(book_id, nf))
     except Exception as e:
         # M6-D4 修复：报告命名与其余报告统一用书名；书号反查失败（本就是异常成因之一）
         # 时才回落书号，保证任何情况下都有落盘位置
@@ -931,24 +984,30 @@ def _selfcheck():
     assert "0007·0003" in rep2 and "0.9" in rep2
     print("  ④ 报告渲染：总览/领号段/四分类/资产统计，无销单指引")
 
-    # ⑤ 沙箱配置往返：SANDBOX_KEYS 全键改写 → 恢复 → 配置内容逐字节一致（不跑子进程）
+    # ⑤ #65 沙箱配置覆盖：真实配置全程零写入；临时配置覆盖全键，异常后环境恢复
     cfg_path = common.PROJECT_ROOT / "路径配置.json"
-    before = cfg_path.read_text(encoding="utf-8")
-    with sandbox_ctx():
-        during = json.loads(cfg_path.read_text(encoding="utf-8"))
+    before = cfg_path.read_bytes()
+    before_obj = json.loads(before)
+    assert common.CONFIG_PATH_ENV not in os.environ, "自检前不应残留沙箱配置环境变量"
+    with sandbox_ctx() as sandbox5:
+        assert cfg_path.read_bytes() == before, "沙箱内改写了真实配置"
+        during = common.load_config()
         for k in SANDBOX_KEYS:
-            assert k in during, f"沙箱键 {k} 不在 路径配置.json（沙箱覆盖不全，#43）"
-            assert str(during[k]).startswith(str(Path(tempfile.gettempdir()))), during[k]
-    after = cfg_path.read_text(encoding="utf-8")
-    assert before == after, "沙箱恢复后配置与改写前不一致"
-    # 异常路径恢复：with 内抛异常也必须恢复
+            assert k in during, f"沙箱键 {k} 不在临时配置（沙箱覆盖不全，#43）"
+            assert Path(during[k]).is_relative_to(sandbox5), during[k]
+        assert Path(os.environ[common.CONFIG_PATH_ENV]).is_relative_to(sandbox5)
+    assert cfg_path.read_bytes() == before
+    assert common.load_config() == before_obj
+    assert common.CONFIG_PATH_ENV not in os.environ
     try:
         with sandbox_ctx():
+            assert cfg_path.read_bytes() == before
             raise RuntimeError("模拟中断")
     except RuntimeError:
         pass
-    assert cfg_path.read_text(encoding="utf-8") == before, "异常退出后配置未恢复"
-    print(f"  ⑤ 沙箱配置往返：{len(SANDBOX_KEYS)} 键改写（含 #43 新增 已入库）/恢复/异常恢复，配置零残留")
+    assert cfg_path.read_bytes() == before, "异常退出后真实配置变化"
+    assert common.CONFIG_PATH_ENV not in os.environ, "异常退出后环境变量未恢复"
+    print(f"  ⑤ 沙箱配置覆盖：{len(SANDBOX_KEYS)} 键全入临时副本，真实配置零写入/异常环境恢复")
 
     # ⑥ M3 装配：保留块照搬 + 新块领号/页标签推导 + 格式与 clean_split 同款（块间空行、无尾空行）
     old_raw6 = {
@@ -1001,7 +1060,13 @@ def _selfcheck():
         reg = json.loads((bd / "退休块.json").read_text(encoding="utf-8"))
         assert len(reg["退休块"]) == 2 and reg["退休块"][0]["后继"] == "0099·0005"
         assert reg["退休块"][1]["原因"] == "删除" and reg["退休块"][1]["后继"] is None
-    print("  ⑧ 退休登记册：新建 + 追加合并")
+        (bd / "退休块.json").write_text("{损坏", encoding="utf-8")
+        try:
+            write_retire_registry(bd, [])
+            raise AssertionError("损坏退休登记册未被拒绝")
+        except RuntimeError as exc:
+            assert "拒绝从空表续写" in str(exc)
+    print("  ⑧ 退休登记册：新建 + 追加合并 + 损坏拒绝续写")
 
     # ⑨ M3 快照/回滚：书目录 + 书目总索引整体往返
     with tempfile.TemporaryDirectory() as td:
@@ -1093,8 +1158,32 @@ def _selfcheck():
             (bd11 / "结构.json").read_text(encoding="utf-8"))} == after11
     print("  ⑪ 结构锚点重基：术后块 ID 跳跃时按标题文本+顺序重定位（无信号书不动）")
 
-    print("update_book 自检通过：反查/解析/预扫/渲染/沙箱/装配/对账/登记册/回滚/待重标/锚点重基 "
-          "×11 组用例")
+    # ⑫ #65 更新保护：真实变化前建立；回滚后仍保留；成功时间可更新；坏标记拒绝续写
+    with tempfile.TemporaryDirectory() as td:
+        kb12 = Path(td) / "知识库"
+        bd12 = kb12 / "书籍" / "保护书"
+        bd12.mkdir(parents=True)
+        (bd12 / "原文.md").write_text("术前", encoding="utf-8")
+        guard12 = mark_update_guard(bd12)
+        data12 = json.loads(guard12.read_text(encoding="utf-8"))
+        assert data12["版本"] == 1 and data12["保护"] == "禁止旧缓存重排"
+        assert data12["最近成功"] is None and data12["最近手术尝试"]
+        snap12, cat12 = _snapshot_book(bd12, kb12, backup_base=Path(td) / "备份")
+        (bd12 / "原文.md").write_text("术中半写", encoding="utf-8")
+        _rollback(bd12, snap12, kb12, cat12)
+        assert guard12.exists(), "回滚删除了更新保护标记"
+        mark_update_guard(bd12, success=True)
+        assert json.loads(guard12.read_text(encoding="utf-8"))["最近成功"] is not None
+        guard12.write_text("{坏标记", encoding="utf-8")
+        try:
+            mark_update_guard(bd12)
+            raise AssertionError("坏更新保护标记未被拒绝")
+        except RuntimeError as exc:
+            assert "更新保护标记损坏" in str(exc)
+    print("  ⑫ 更新保护：术前建立/回滚保留/成功记录/坏标记拒绝")
+
+    print("update_book 自检通过：反查/解析/预扫/渲染/沙箱/装配/对账/登记册/回滚/待重标/锚点重基/更新保护 "
+          "×12 组用例")
 
 
 if __name__ == "__main__":

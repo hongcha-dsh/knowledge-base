@@ -9,7 +9,10 @@
 """
 
 import json
+import os
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 PROJECT_ROOT: Path = None
@@ -32,11 +35,87 @@ RULE_PAN_SPLIT = "排盘_多盘合表拆分"     # 6/9 行盘式合表拆回逐�
 RULE_CHART_EXEMPT = "豁免图表块收纳"      # 跳过图表块合并（盘逐盘独立成块、进任务包）
 
 
+CONFIG_PATH_ENV = "KB_CONFIG_PATH"
+
+
 def load_config() -> dict:
-    """读取唯一起点配置文件 路径配置.json。"""
-    cfg_path = PROJECT_ROOT / "路径配置.json"
+    """读取起点配置；沙箱子进程可由 KB_CONFIG_PATH 指定临时配置副本。"""
+    override = os.environ.get(CONFIG_PATH_ENV)
+    cfg_path = Path(override) if override else PROJECT_ROOT / "路径配置.json"
+    if not cfg_path.is_absolute():
+        cfg_path = PROJECT_ROOT / cfg_path
     with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def atomic_write_text(path, text: str, *, encoding: str = "utf-8", newline=None) -> Path:
+    """同目录临时文件 + os.replace 原子写；默认换行行为与 Path.write_text 一致。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+    return path
+
+
+WRITE_LOCK_ENV = "KB_WRITE_LOCK_OWNER"
+
+
+@contextmanager
+def exclusive_write_lock(task_name: str):
+    """全库写任务互斥；同一控制台事务的子进程经环境继承拥有者身份。"""
+    if os.environ.get(WRITE_LOCK_ENV):
+        yield
+        return
+    lock_path = get_path("输出") / ".locks" / "知识库.write.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+b")
+    try:
+        if fh.tell() == 0:
+            fh.write(b"0")
+            fh.flush()
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            locking = lambda: msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            unlock = lambda: msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            locking = lambda: fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            unlock = lambda: fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        try:
+            locking()
+        except OSError as e:
+            raise RuntimeError(f"已有其他写任务正在运行，请等待完成后再试（{task_name}）") from e
+        previous = os.environ.get(WRITE_LOCK_ENV)
+        os.environ[WRITE_LOCK_ENV] = f"{os.getpid()}:{task_name}"
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(WRITE_LOCK_ENV, None)
+            else:
+                os.environ[WRITE_LOCK_ENV] = previous
+            fh.seek(0)
+            unlock()
+    finally:
+        fh.close()
+
+
+def run_with_write_lock(main_func, task_name: str):
+    """脚本正常写模式入口；--自检 分支由调用方先行分流，不进写锁。"""
+    with exclusive_write_lock(task_name):
+        return main_func()
 
 
 def get_path(name: str):
@@ -153,9 +232,7 @@ def write_report(name: str, content: str) -> Path:
         content += ("\n---\n本报告为待处理问题：问题解决后请删除本文件，"
                     "或重跑对应步骤验证为绿后由程序自动删除。\n")
     path = rd / name
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return path
+    return atomic_write_text(path, content)
 
 
 def clear_report(name: str):
@@ -178,6 +255,26 @@ def norm_rel(path_str: str) -> Path:
     return (PROJECT_ROOT / path_str).resolve()
 
 
+_OPENCC = None  # #65 M3：OpenCC 单例（构造器无跨实例缓存，逐行新建会反复重载字典）
+
+
+def _opencc():
+    """#65 M3（设计 §4.6）：每进程至多构造一次 OpenCC，不改变任何归一规则。"""
+    global _OPENCC
+    if _OPENCC is None:
+        from opencc import OpenCC
+        _OPENCC = OpenCC("t2s")
+    return _OPENCC
+
+
+def dump_index_json(data) -> str:
+    """#65 M3（设计 §4.7）：倒排表统一紧凑序列化。
+
+    ensure_ascii=False、字段与数组顺序、值均不变，只去缩进空白；所有倒排表写入点
+    共用本函数，避免 A-04 写紧凑后又被 A-06 题干补写重新格式化。"""
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
 def normalize_for_search(line: str) -> str:
     """检索副本同款归一：简繁归一 + 去空白与标点（闸门①字符 diff 双侧同款处理）。
 
@@ -185,8 +282,7 @@ def normalize_for_search(line: str) -> str:
     被归一化成垃圾检索词 `85br六`。"""
     import re
     try:
-        from opencc import OpenCC
-        cc = OpenCC("t2s")
+        cc = _opencc()
         s = cc.convert(line)
     except ImportError:
         s = line
@@ -237,7 +333,7 @@ def save_ingest_registry(rows: list):
     rows = [r for r in rows if r and r.get("文件名")]
     p = get_path("已入库") / "_入库登记.json"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(p, json.dumps(rows, ensure_ascii=False, indent=2))
 
 
 def book_rule_path(book_title: str) -> Path:
@@ -270,7 +366,7 @@ def save_book_config(book_title: str, config: dict):
     p.parent.mkdir(parents=True, exist_ok=True)
     existing = load_book_config(book_title)
     existing.update(config)
-    p.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(p, json.dumps(existing, ensure_ascii=False, indent=2))
 
 
 def load_book_rules(book_title: str) -> dict:
@@ -293,7 +389,7 @@ def save_book_rules(book_title: str, rules: dict):
     """写按书特化规则文件（供控制台勾选使用）。"""
     p = book_rule_path(book_title)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(p, json.dumps(rules, ensure_ascii=False, indent=2))
 
 
 def _collect_book_ids() -> list:
